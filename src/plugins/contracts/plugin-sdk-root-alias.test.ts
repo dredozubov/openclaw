@@ -458,10 +458,25 @@ describe("plugin-sdk root alias", () => {
       "plugin-sdk",
       "codex-mcp-projection.ts",
     );
+    const sourceCodexNativeTaskRuntimePath = path.join(
+      packageRoot,
+      "src",
+      "plugin-sdk",
+      "codex-native-task-runtime.ts",
+    );
     const sourceQaRuntimePath = path.join(packageRoot, "src", "plugin-sdk", "qa-runtime.ts");
     const lazyModule = loadRootAliasWithStubs({
+      packageExports: {
+        "./plugin-sdk/codex-native-task-runtime": {
+          default: "./dist/plugin-sdk/codex-native-task-runtime.js",
+        },
+      },
       privateLocalOnlySubpaths: ["codex-mcp-projection", "qa-runtime"],
-      existingPaths: [sourceCodexMcpProjectionPath, sourceQaRuntimePath],
+      existingPaths: [
+        sourceCodexMcpProjectionPath,
+        sourceCodexNativeTaskRuntimePath,
+        sourceQaRuntimePath,
+      ],
       monolithicExports: {
         slowHelper: (): string => "loaded",
       },
@@ -471,6 +486,8 @@ describe("plugin-sdk root alias", () => {
     const aliasMap = (lazyModule.createJitiOptions.at(-1)?.alias ?? {}) as Record<string, string>;
     expect(aliasMap).not.toHaveProperty("openclaw/plugin-sdk/codex-mcp-projection");
     expect(aliasMap).not.toHaveProperty("@openclaw/plugin-sdk/codex-mcp-projection");
+    expect(aliasMap).not.toHaveProperty("openclaw/plugin-sdk/codex-native-task-runtime");
+    expect(aliasMap).not.toHaveProperty("@openclaw/plugin-sdk/codex-native-task-runtime");
     expect(aliasMap).not.toHaveProperty("openclaw/plugin-sdk/qa-runtime");
   });
 
@@ -621,7 +638,7 @@ describe("plugin-sdk root alias", () => {
     }
   });
 
-  it("does not publish private local-only plugin-sdk subpaths", () => {
+  it("does not publish private local-only plugin-sdk subpaths beyond explicit compat exceptions", () => {
     const packageJson = JSON.parse(fs.readFileSync(packageJsonPath, "utf-8")) as {
       exports?: Record<string, unknown>;
     };
@@ -632,8 +649,16 @@ describe("plugin-sdk root alias", () => {
       "plugin-sdk-private-local-only-subpaths.json",
     );
     const privateSubpaths = JSON.parse(fs.readFileSync(privateSubpathsPath, "utf-8")) as string[];
+    const packageExportedCompatExceptions = new Set(["codex-native-task-runtime"]);
 
     for (const subpath of privateSubpaths) {
+      if (packageExportedCompatExceptions.has(subpath)) {
+        expect(packageJson.exports?.[`./plugin-sdk/${subpath}`]).toEqual({
+          types: `./dist/plugin-sdk/${subpath}.d.ts`,
+          default: `./dist/plugin-sdk/${subpath}.js`,
+        });
+        continue;
+      }
       expect(packageJson.exports?.[`./plugin-sdk/${subpath}`]).toBeUndefined();
     }
   });
