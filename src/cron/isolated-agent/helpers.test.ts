@@ -1,59 +1,83 @@
 import { describe, expect, it } from "vitest";
 import {
   isHeartbeatOnlyResponse,
+  pickDeliverablePayloads,
   pickLastDeliverablePayload,
   pickLastNonEmptyTextFromPayloads,
   pickSummaryFromPayloads,
+  resolveCronPayloadOutcome,
 } from "./helpers.js";
 
-describe("pickSummaryFromPayloads", () => {
-  it("picks real text over error payload", () => {
-    const payloads = [
+type TextPayload = { text?: string | undefined; isError?: boolean | undefined };
+
+const textPayloadPickerCases: Array<{
+  name: string;
+  pick: (payloads: TextPayload[]) => string | undefined;
+  payloads: TextPayload[];
+  expected: string | undefined;
+}> = [
+  {
+    name: "summary picks real text over error payload",
+    pick: pickSummaryFromPayloads,
+    payloads: [
       { text: "Here is your summary" },
       { text: "Tool error: rate limited", isError: true },
-    ];
-    expect(pickSummaryFromPayloads(payloads)).toBe("Here is your summary");
-  });
-
-  it("falls back to error payload when no real text exists", () => {
-    const payloads = [{ text: "Tool error: rate limited", isError: true }];
-    expect(pickSummaryFromPayloads(payloads)).toBe("Tool error: rate limited");
-  });
-
-  it("returns undefined for empty payloads", () => {
-    expect(pickSummaryFromPayloads([])).toBeUndefined();
-  });
-
-  it("treats isError: undefined as non-error", () => {
-    const payloads = [
+    ],
+    expected: "Here is your summary",
+  },
+  {
+    name: "summary falls back to error payload when no real text exists",
+    pick: pickSummaryFromPayloads,
+    payloads: [{ text: "Tool error: rate limited", isError: true }],
+    expected: "Tool error: rate limited",
+  },
+  {
+    name: "summary returns undefined for empty payloads",
+    pick: pickSummaryFromPayloads,
+    payloads: [],
+    expected: undefined,
+  },
+  {
+    name: "summary treats isError: undefined as non-error",
+    pick: pickSummaryFromPayloads,
+    payloads: [
       { text: "normal text", isError: undefined },
       { text: "error text", isError: true },
-    ];
-    expect(pickSummaryFromPayloads(payloads)).toBe("normal text");
-  });
-});
-
-describe("pickLastNonEmptyTextFromPayloads", () => {
-  it("picks real text over error payload", () => {
-    const payloads = [{ text: "Real output" }, { text: "Service error", isError: true }];
-    expect(pickLastNonEmptyTextFromPayloads(payloads)).toBe("Real output");
-  });
-
-  it("falls back to error payload when no real text exists", () => {
-    const payloads = [{ text: "Service error", isError: true }];
-    expect(pickLastNonEmptyTextFromPayloads(payloads)).toBe("Service error");
-  });
-
-  it("returns undefined for empty payloads", () => {
-    expect(pickLastNonEmptyTextFromPayloads([])).toBeUndefined();
-  });
-
-  it("treats isError: undefined as non-error", () => {
-    const payloads = [
+    ],
+    expected: "normal text",
+  },
+  {
+    name: "last non-empty text picks real text over error payload",
+    pick: pickLastNonEmptyTextFromPayloads,
+    payloads: [{ text: "Real output" }, { text: "Service error", isError: true }],
+    expected: "Real output",
+  },
+  {
+    name: "last non-empty text falls back to error payload when no real text exists",
+    pick: pickLastNonEmptyTextFromPayloads,
+    payloads: [{ text: "Service error", isError: true }],
+    expected: "Service error",
+  },
+  {
+    name: "last non-empty text returns undefined for empty payloads",
+    pick: pickLastNonEmptyTextFromPayloads,
+    payloads: [],
+    expected: undefined,
+  },
+  {
+    name: "last non-empty text treats isError: undefined as non-error",
+    pick: pickLastNonEmptyTextFromPayloads,
+    payloads: [
       { text: "good", isError: undefined },
       { text: "bad", isError: true },
-    ];
-    expect(pickLastNonEmptyTextFromPayloads(payloads)).toBe("good");
+    ],
+    expected: "good",
+  },
+];
+
+describe("text payload pickers", () => {
+  it.each(textPayloadPickerCases)("$name", ({ pick, payloads, expected }) => {
+    expect(pick(payloads)).toBe(expected);
   });
 });
 
@@ -79,10 +103,115 @@ describe("pickLastDeliverablePayload", () => {
     expect(pickLastDeliverablePayload([media, error])).toBe(media);
   });
 
+  it("picks presentation-only payload over error text payload", () => {
+    const presentation = {
+      presentation: {
+        blocks: [{ type: "buttons" as const, buttons: [{ label: "Ack", value: "ack" }] }],
+      },
+    };
+    const error = { text: "Error warning", isError: true as const };
+    expect(pickLastDeliverablePayload([presentation, error])).toBe(presentation);
+  });
+
   it("treats isError: undefined as non-error", () => {
     const normal = { text: "ok", isError: undefined };
     const error = { text: "bad", isError: true as const };
     expect(pickLastDeliverablePayload([normal, error])).toBe(normal);
+  });
+});
+
+describe("pickDeliverablePayloads", () => {
+  it("preserves all successful deliverable payloads", () => {
+    const payloads = [
+      { text: "line 1" },
+      { text: "temporary error", isError: true as const },
+      { text: "line 2" },
+    ];
+
+    expect(pickDeliverablePayloads(payloads)).toEqual([{ text: "line 1" }, { text: "line 2" }]);
+  });
+
+  it("preserves rich-only successful deliverable payloads", () => {
+    const presentation = {
+      presentation: {
+        blocks: [{ type: "buttons" as const, buttons: [{ label: "Ack", value: "ack" }] }],
+      },
+    };
+
+    expect(pickDeliverablePayloads([presentation])).toEqual([presentation]);
+  });
+
+  it("returns only the last error payload when all payloads are errors", () => {
+    const payloads = [
+      { text: "first error", isError: true as const },
+      { text: "last error", isError: true as const },
+    ];
+
+    expect(pickDeliverablePayloads(payloads)).toEqual([{ text: "last error", isError: true }]);
+  });
+});
+
+describe("resolveCronPayloadOutcome", () => {
+  it("keeps recovered read-only fetch warnings from failing cron runs", () => {
+    const finalText =
+      "Deploy is green. The live owner page and representative club claim CTA are verified.";
+
+    const outcome = resolveCronPayloadOutcome({
+      payloads: [
+        { text: finalText },
+        {
+          text: '⚠️ 🛠️ `fetch https://mypadelway.com/owner -> search "Claim your venue"` failed',
+          isError: true,
+        },
+      ],
+      finalAssistantVisibleText: finalText,
+      preferFinalAssistantVisibleText: false,
+    });
+
+    expect(outcome.hasFatalErrorPayload).toBe(false);
+    expect(outcome.embeddedRunError).toBeUndefined();
+    expect(outcome.outputText).toBe(finalText);
+    expect(outcome.deliveryPayloads).toEqual([{ text: finalText }]);
+  });
+
+  it("keeps recovered read-only search warnings from failing cron runs", () => {
+    const finalText = "The fallback source verified the deploy.";
+
+    const outcome = resolveCronPayloadOutcome({
+      payloads: [
+        { text: finalText },
+        {
+          text: '⚠️ 🛠️ `search "mypadelway owner copy"` failed',
+          isError: true,
+        },
+      ],
+      finalAssistantVisibleText: finalText,
+      preferFinalAssistantVisibleText: false,
+    });
+
+    expect(outcome.hasFatalErrorPayload).toBe(false);
+    expect(outcome.outputText).toBe(finalText);
+    expect(outcome.deliveryPayloads).toEqual([{ text: finalText }]);
+  });
+
+  it("keeps mutating tool warnings fatal after success-looking cron output", () => {
+    const finalText = "Done.";
+
+    const outcome = resolveCronPayloadOutcome({
+      payloads: [
+        { text: finalText },
+        {
+          text: "⚠️ 🛠️ `write /tmp/report.md` failed",
+          isError: true,
+        },
+      ],
+      finalAssistantVisibleText: finalText,
+      preferFinalAssistantVisibleText: false,
+    });
+
+    expect(outcome.hasFatalErrorPayload).toBe(true);
+    expect(outcome.embeddedRunError).toBe("⚠️ 🛠️ `write /tmp/report.md` failed");
+    expect(outcome.outputText).toBe("⚠️ 🛠️ `write /tmp/report.md` failed");
   });
 });
 
@@ -121,6 +250,22 @@ describe("isHeartbeatOnlyResponse", () => {
     expect(
       isHeartbeatOnlyResponse(
         [{ text: "HEARTBEAT_OK", mediaUrl: "https://example.com/img.png" }],
+        ACK_MAX,
+      ),
+    ).toBe(false);
+  });
+
+  it("returns false when rich content is present even with HEARTBEAT_OK text", () => {
+    expect(
+      isHeartbeatOnlyResponse(
+        [
+          {
+            text: "HEARTBEAT_OK",
+            presentation: {
+              blocks: [{ type: "buttons", buttons: [{ label: "Open", value: "open" }] }],
+            },
+          },
+        ],
         ACK_MAX,
       ),
     ).toBe(false);

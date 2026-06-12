@@ -1,3 +1,6 @@
+import { normalizeBlockedLivenessWaitStatus } from "../../shared/agent-liveness.js";
+import { isNonTerminalAgentRunStatus } from "../../shared/agent-run-status.js";
+import { setSafeTimeout } from "../../utils/timer-delay.js";
 import type { DedupeEntry } from "../server-shared.js";
 
 export type AgentWaitTerminalSnapshot = {
@@ -5,6 +8,9 @@ export type AgentWaitTerminalSnapshot = {
   startedAt?: number;
   endedAt?: number;
   error?: string;
+  stopReason?: string;
+  livenessState?: string;
+  yielded?: boolean;
 };
 
 const AGENT_WAITERS_BY_RUN_ID = new Map<string, Set<() => void>>();
@@ -23,6 +29,27 @@ function asFiniteNumber(value: unknown): number | undefined {
   return typeof value === "number" && Number.isFinite(value) ? value : undefined;
 }
 
+function asRecord(value: unknown): Record<string, unknown> | undefined {
+  return value && typeof value === "object" && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : undefined;
+}
+
+function asString(value: unknown): string | undefined {
+  return typeof value === "string" && value.trim() ? value : undefined;
+}
+
+function removeWaiter(runId: string, waiter: () => void): void {
+  const waiters = AGENT_WAITERS_BY_RUN_ID.get(runId);
+  if (!waiters) {
+    return;
+  }
+  waiters.delete(waiter);
+  if (waiters.size === 0) {
+    AGENT_WAITERS_BY_RUN_ID.delete(runId);
+  }
+}
+
 function addWaiter(runId: string, waiter: () => void): () => void {
   const normalizedRunId = runId.trim();
   if (!normalizedRunId) {
@@ -31,28 +58,10 @@ function addWaiter(runId: string, waiter: () => void): () => void {
   const existing = AGENT_WAITERS_BY_RUN_ID.get(normalizedRunId);
   if (existing) {
     existing.add(waiter);
-    return () => {
-      const waiters = AGENT_WAITERS_BY_RUN_ID.get(normalizedRunId);
-      if (!waiters) {
-        return;
-      }
-      waiters.delete(waiter);
-      if (waiters.size === 0) {
-        AGENT_WAITERS_BY_RUN_ID.delete(normalizedRunId);
-      }
-    };
+    return () => removeWaiter(normalizedRunId, waiter);
   }
   AGENT_WAITERS_BY_RUN_ID.set(normalizedRunId, new Set([waiter]));
-  return () => {
-    const waiters = AGENT_WAITERS_BY_RUN_ID.get(normalizedRunId);
-    if (!waiters) {
-      return;
-    }
-    waiters.delete(waiter);
-    if (waiters.size === 0) {
-      AGENT_WAITERS_BY_RUN_ID.delete(normalizedRunId);
-    }
-  };
+  return () => removeWaiter(normalizedRunId, waiter);
 }
 
 function notifyWaiters(runId: string): void {
@@ -69,9 +78,7 @@ function notifyWaiters(runId: string): void {
   }
 }
 
-export function readTerminalSnapshotFromDedupeEntry(
-  entry: DedupeEntry,
-): AgentWaitTerminalSnapshot | null {
+function readTerminalSnapshotFromDedupeEntry(entry: DedupeEntry): AgentWaitTerminalSnapshot | null {
   const payload = entry.payload as
     | {
         status?: unknown;
@@ -79,15 +86,23 @@ export function readTerminalSnapshotFromDedupeEntry(
         endedAt?: unknown;
         error?: unknown;
         summary?: unknown;
+        stopReason?: unknown;
+        livenessState?: unknown;
+        yielded?: unknown;
+        result?: unknown;
       }
     | undefined;
   const status = typeof payload?.status === "string" ? payload.status : undefined;
-  if (status === "accepted" || status === "started" || status === "in_flight") {
+  if (isNonTerminalAgentRunStatus(status)) {
     return null;
   }
 
   const startedAt = asFiniteNumber(payload?.startedAt);
   const endedAt = asFiniteNumber(payload?.endedAt) ?? entry.ts;
+  const resultMeta = asRecord(asRecord(payload?.result)?.meta);
+  const stopReason = asString(payload?.stopReason) ?? asString(resultMeta?.stopReason);
+  const livenessState = asString(payload?.livenessState) ?? asString(resultMeta?.livenessState);
+  const yielded = payload?.yielded === true || resultMeta?.yielded === true;
   const errorMessage =
     typeof payload?.error === "string"
       ? payload.error
@@ -96,11 +111,24 @@ export function readTerminalSnapshotFromDedupeEntry(
         : entry.error?.message;
 
   if (status === "ok" || status === "timeout") {
-    return {
+    const normalized = normalizeBlockedLivenessWaitStatus({
       status,
+      livenessState,
+      error: errorMessage,
+    });
+    return {
+      status: normalized.status,
       startedAt,
       endedAt,
-      error: status === "timeout" ? errorMessage : undefined,
+      error:
+        normalized.status === "error"
+          ? normalized.error
+          : normalized.status === "timeout"
+            ? errorMessage
+            : undefined,
+      stopReason,
+      livenessState,
+      ...(yielded ? { yielded } : {}),
     };
   }
   if (status === "error" || !entry.ok) {
@@ -109,6 +137,9 @@ export function readTerminalSnapshotFromDedupeEntry(
       startedAt,
       endedAt,
       error: errorMessage,
+      stopReason,
+      livenessState,
+      ...(yielded ? { yielded } : {}),
     };
   }
   return null;
@@ -201,8 +232,7 @@ export async function waitForTerminalGatewayDedupe(params: {
       return;
     }
 
-    const timeoutDelayMs = Math.max(1, Math.min(Math.floor(params.timeoutMs), 2_147_483_647));
-    timeoutHandle = setTimeout(() => finish(null), timeoutDelayMs);
+    timeoutHandle = setSafeTimeout(() => finish(null), params.timeoutMs);
     timeoutHandle.unref?.();
 
     onAbort = () => finish(null);
@@ -215,19 +245,24 @@ export function setGatewayDedupeEntry(params: {
   key: string;
   entry: DedupeEntry;
 }) {
+  const existing = params.dedupe.get(params.key);
+  const existingSnapshot = existing ? readTerminalSnapshotFromDedupeEntry(existing) : null;
+  const incomingSnapshot = readTerminalSnapshotFromDedupeEntry(params.entry);
+  if (existingSnapshot?.status === "timeout" && existingSnapshot.stopReason === "rpc") {
+    return;
+  }
   params.dedupe.set(params.key, params.entry);
   const runId = parseRunIdFromDedupeKey(params.key);
   if (!runId) {
     return;
   }
-  const snapshot = readTerminalSnapshotFromDedupeEntry(params.entry);
-  if (!snapshot) {
+  if (!incomingSnapshot) {
     return;
   }
   notifyWaiters(runId);
 }
 
-export const __testing = {
+export const testing = {
   getWaiterCount(runId?: string): number {
     if (runId) {
       return AGENT_WAITERS_BY_RUN_ID.get(runId)?.size ?? 0;
@@ -242,3 +277,4 @@ export const __testing = {
     AGENT_WAITERS_BY_RUN_ID.clear();
   },
 };
+export { testing as __testing };
